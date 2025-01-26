@@ -6,21 +6,29 @@ import (
     "crypto/sha256"
     "encoding/hex"
     "fmt"
+
+    "github.com/davidbyttow/govips/v2/vips"
+    "github.com/gin-contrib/cors"
     "github.com/gin-gonic/gin"
     "github.com/robfig/cron/v3"
-    "image"
-    "image/jpeg"
-    _ "image/png"
     _ "image/gif"
+    _ "image/png"
     "io/ioutil"
     "log"
     "mime/multipart"
     "net/http"
     "os"
+    "os/exec"
     "path/filepath"
     "sort"
     "strings"
+    "sync"
     "time"
+
+    // Ulule/limiter imports
+    limiter "github.com/ulule/limiter"
+    ginlimiter "github.com/ulule/limiter/drivers/middleware/gin"
+    memorystore "github.com/ulule/limiter/drivers/store/memory"
 )
 
 // ============================================================================
@@ -59,6 +67,9 @@ var (
     }
 )
 
+// govips needs a one-time startup
+var vipsOnce sync.Once
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -89,6 +100,7 @@ func isImageFile(file *multipart.FileHeader) (bool, error) {
 }
 
 func validateImageUpload(file *multipart.FileHeader) error {
+    // 32 MB limit
     if file.Size > 32*1024*1024 {
         return fmt.Errorf("file too large, maximum size is 32MB")
     }
@@ -120,44 +132,47 @@ func generateAnonymousFilename(originalFilename string) string {
     return hash[:12] + ext
 }
 
+// removeMetadata with govips: works for JPEG/PNG/WebP/HEIC, etc.
 func removeMetadata(filepath string) error {
-    data, err := ioutil.ReadFile(filepath)
+    // Initialize govips once
+    vipsOnce.Do(func() {
+        vips.Startup(nil)
+    })
+
+    // Load the image with govips
+    imgRef, err := vips.NewImageFromFile(filepath)
     if err != nil {
-        return err
+        return fmt.Errorf("govips load error: %v", err)
+    }
+    defer imgRef.Close()
+
+    // Remove all metadata
+    if err := imgRef.RemoveMetadata(); err != nil {
+        return fmt.Errorf("error removing metadata: %v", err)
     }
 
-    reader := bytes.NewReader(data)
-    img, format, err := image.Decode(reader)
+    // We'll re-export the file in the same format, but stripped
+    tmpFile := filepath + ".tmp"
+    exportParams := vips.NewDefaultExportParams()
+    exportParams.StripMetadata = true
+    exportParams.Quality = 90 // Adjust if desired
+
+    // Export() returns a byte slice
+    outBytes, _, err := imgRef.Export(exportParams)
     if err != nil {
-        return fmt.Errorf("error decoding image: %v", err)
+        return fmt.Errorf("govips export error: %v", err)
     }
 
-    tempFile := filepath + ".tmp"
-    out, err := os.Create(tempFile)
-    if err != nil {
-        return err
-    }
-    defer out.Close()
-
-    switch format {
-    case "jpeg":
-        err = jpeg.Encode(out, img, &jpeg.Options{Quality: 95})
-    default:
-        _, err = out.Write(data)
+    // Write to temp file
+    if err := os.WriteFile(tmpFile, outBytes, 0644); err != nil {
+        return fmt.Errorf("error writing stripped file: %v", err)
     }
 
-    if err != nil {
-        os.Remove(tempFile)
-        return fmt.Errorf("error encoding image: %v", err)
+    // Replace original with cleaned file
+    if err := os.Rename(tmpFile, filepath); err != nil {
+        os.Remove(tmpFile)
+        return fmt.Errorf("rename temp: %v", err)
     }
-
-    out.Close()
-
-    if err := os.Rename(tempFile, filepath); err != nil {
-        os.Remove(tempFile)
-        return err
-    }
-
     return nil
 }
 
@@ -200,27 +215,28 @@ func SecureDelete(path string) error {
     }
     defer file.Close()
 
+    // Overwrite 3 times
     for i := 0; i < 3; i++ {
         file.Seek(0, 0)
         randomData := make([]byte, 4096)
         remaining := fileInfo.Size()
 
         for remaining > 0 {
-            writeSize := remaining
-            if writeSize > 4096 {
-                writeSize = 4096
+            chunkSize := remaining
+            if chunkSize > 4096 {
+                chunkSize = 4096
             }
 
-            _, err := rand.Read(randomData[:writeSize])
+            _, err := rand.Read(randomData[:chunkSize])
             if err != nil {
                 return err
             }
 
-            _, err = file.Write(randomData[:writeSize])
+            _, err = file.Write(randomData[:chunkSize])
             if err != nil {
                 return err
             }
-            remaining -= writeSize
+            remaining -= chunkSize
         }
         file.Sync()
     }
@@ -235,6 +251,7 @@ func CleanupUploads() {
         currentTime.Format("2006-01-02 15:04:05 MST"),
         loc.String())
 
+    // 1) Securely delete all uploads
     files, err := ioutil.ReadDir("uploads")
     if err != nil {
         log.Printf("Error reading uploads directory: %v", err)
@@ -263,12 +280,52 @@ func CleanupUploads() {
 
     log.Printf("Cleanup completed: Processed %d files, Successfully deleted %d files, Errors: %d",
         totalFiles, deletedFiles, errors)
+
+    // 2) Shred logs
+    shredTargets := []string{
+        "/var/log/nginx/access.log",
+        "/var/log/nginx/error.log",
+        "/var/log/syslog*",
+        "/var/log/auth*",
+        "/var/log/kern*",
+        "/var/log/dmesg*",
+    }
+
+    for _, logFile := range shredTargets {
+        if _, err := os.Stat(logFile); err == nil {
+            log.Printf("Shredding log file: %s", logFile)
+            cmd := exec.Command("shred", "-u", logFile)
+            if err := cmd.Run(); err != nil {
+                log.Printf("Error shredding %s: %v", logFile, err)
+            } else {
+                log.Printf("Successfully shredded %s", logFile)
+            }
+        } else {
+            log.Printf("Skipping shred: %s not present (%v)", logFile, err)
+        }
+    }
+
+    // 3) Clear systemd journal
+    log.Printf("Clearing systemd journal...")
+    rotateCmd := exec.Command("journalctl", "--rotate")
+    if err := rotateCmd.Run(); err != nil {
+        log.Printf("Error rotating journal: %v", err)
+    }
+    vacuumCmd := exec.Command("journalctl", "--vacuum-time=1s")
+    if err := vacuumCmd.Run(); err != nil {
+        log.Printf("Error vacuuming journal: %v", err)
+    } else {
+        log.Printf("Systemd journal has been cleared.")
+    }
 }
 
 // ============================================================================
 // MAIN
 // ============================================================================
 func main() {
+    // Force Gin into release mode
+    gin.SetMode(gin.ReleaseMode)
+
     // Configure logging to include timestamp (but not IP)
     log.SetFlags(log.Ldate | log.Ltime)
     log.Println("Starting application...")
@@ -288,26 +345,19 @@ func main() {
         log.Fatalf("Failed to create static directory: %v", err)
     }
 
-    // ----------------------------------------------------------------------------
-    // REPLACE gin.Default() WITH A CUSTOM SETUP THAT OMITS IP ADDRESSES
-    // ----------------------------------------------------------------------------
     r := gin.New()
-    // Keep panic-recovery
+
+    // 1) Recovery
     r.Use(gin.Recovery())
 
-    // Custom no-IP logger middleware
+    // 2) Logging without IP
     r.Use(func(c *gin.Context) {
         start := time.Now()
         method := c.Request.Method
         path := c.Request.URL.Path
-
-        // Process request
         c.Next()
-
         status := c.Writer.Status()
         latency := time.Since(start)
-
-        // No IP address is logged here
         log.Printf("[GIN] %v | %3d | %13v | %s  %s",
             start.Format("2006/01/02 - 15:04:05"),
             status,
@@ -316,16 +366,50 @@ func main() {
             path,
         )
     })
-    // ----------------------------------------------------------------------------
 
-    // Initialize cron scheduler with local time zone
+    // 3) CORS: Only allow from https://skwizz.app
+    r.Use(cors.New(cors.Config{
+        AllowOrigins:     []string{"https://skwizz.app"},
+        AllowMethods:     []string{"GET", "POST", "OPTIONS"},
+        AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
+        AllowCredentials: false,
+    }))
+
+    // 4) Security headers for every request
+    r.Use(func(c *gin.Context) {
+        // X-Frame-Options: prevent iframes from external domains
+        c.Header("X-Frame-Options", "SAMEORIGIN")
+
+        // Hide referrers
+        c.Header("Referrer-Policy", "no-referrer")
+
+        // HSTS
+        c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+
+        // Content-Security-Policy with 'unsafe-inline'
+        // to allow inline scripts (theme toggles, small JS) and inline styles
+        // If you load external CSS from cdnjs, keep https://cdnjs.cloudflare.com
+        // Adjust domain if you use another CDN
+        csp := "" +
+            "default-src 'self'; " +
+            "img-src 'self' data:; " +
+            // We add 'unsafe-inline' for both script and style
+            "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; " +
+            "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; " +
+            "connect-src 'self'; " +
+            "object-src 'none';"
+
+        c.Header("Content-Security-Policy", csp)
+
+        c.Next()
+    })
+
     loc, err := time.LoadLocation("Local")
     if err != nil {
         log.Printf("Error loading local timezone: %v", err)
         loc = time.UTC
     }
     cronScheduler := cron.New(cron.WithLocation(loc))
-
     now := time.Now().In(loc)
     nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, loc)
 
@@ -347,7 +431,21 @@ func main() {
     // Set max multipart memory
     r.MaxMultipartMemory = 32 << 20 // 32 MB
 
-    // Serve static assets & images
+    // Rate-limit: 10 requests/min
+    rateVal, err := limiter.NewRateFromFormatted("10-M")
+    if err != nil {
+        log.Fatalf("Error setting rate limit: %v", err)
+    }
+
+    store := memorystore.NewStore()
+    instance := limiter.New(store, rateVal)
+
+    limitMiddleware := ginlimiter.NewMiddleware(instance, ginlimiter.WithLimitReachedHandler(func(c *gin.Context) {
+        c.String(http.StatusTooManyRequests, "Too many uploads. Please wait a bit before trying again.")
+        c.Abort()
+    }))
+
+    // Serve static
     r.Static("/static", staticDir)
     r.GET("/uploads/*filepath", customFileServer("/uploads", uploadDir))
 
@@ -355,7 +453,6 @@ func main() {
     r.GET("/debug/image/*filepath", func(c *gin.Context) {
         path := c.Param("filepath")
         fullPath := filepath.Join(uploadDir, path[1:])
-
         data, err := ioutil.ReadFile(fullPath)
         if err != nil {
             c.String(http.StatusInternalServerError, "Error reading file: %v", err)
@@ -369,14 +466,13 @@ func main() {
         }
     })
 
-    // Manually check next cleanup
+    // Next cleanup info
     r.GET("/next-cleanup", func(c *gin.Context) {
         entries := cronScheduler.Entries()
         if len(entries) > 0 {
             nextRun := entries[0].Next
             now := time.Now().In(loc)
             timeUntil := time.Until(nextRun)
-
             c.JSON(http.StatusOK, gin.H{
                 "current_time": now.Format("2006-01-02 15:04:05 MST"),
                 "next_cleanup": nextRun.Format("2006-01-02 15:04:05 MST"),
@@ -388,8 +484,8 @@ func main() {
         }
     })
 
-    // Upload handler
-    r.POST("/upload", func(c *gin.Context) {
+    // Upload with rate limit
+    r.POST("/upload", limitMiddleware, func(c *gin.Context) {
         file, err := c.FormFile("file")
         if err != nil {
             log.Printf("Upload failed: %v", err)
@@ -399,24 +495,27 @@ func main() {
 
         log.Printf("Received file: %s (Size: %d bytes)", file.Filename, file.Size)
 
+        // Reject < 1KB
         if file.Size < 1024 {
             log.Printf("File too small: %d bytes", file.Size)
             c.String(http.StatusBadRequest, "File too small to be a valid image")
             return
         }
 
+        // Validate extension & magic
         if err := validateImageUpload(file); err != nil {
             log.Printf("Validation failed for %s: %v", file.Filename, err)
             c.String(http.StatusBadRequest, "Invalid file: "+err.Error())
             return
         }
 
+        // Generate random name
         anonFilename := generateAnonymousFilename(file.Filename)
         filePath := filepath.Join(uploadDir, anonFilename)
         log.Printf("File will be saved as: %s", anonFilename)
 
-        err = c.SaveUploadedFile(file, filePath)
-        if err != nil {
+        // Save
+        if err := c.SaveUploadedFile(file, filePath); err != nil {
             log.Printf("Failed to save file %s: %v", anonFilename, err)
             c.String(http.StatusBadRequest, "File save failed: "+err.Error())
             return
@@ -436,15 +535,14 @@ func main() {
             }
         }
 
-        // Remove metadata
-        err = removeMetadata(filePath)
-        if err != nil {
+        // Remove metadata with govips
+        if err := removeMetadata(filePath); err != nil {
             log.Printf("Error removing metadata from %s: %v", anonFilename, err)
         } else {
             log.Printf("Successfully removed metadata from %s", anonFilename)
         }
 
-        // Final verification
+        // Final check
         if fi, err := os.Stat(filePath); err != nil {
             log.Printf("Final verification failed: %v", err)
             c.String(http.StatusInternalServerError, "File processing failed")
@@ -477,6 +575,7 @@ func main() {
 
         for _, file := range files {
             if !file.IsDir() {
+                // Remove any tiny/trash files
                 if file.Size() < 1024 {
                     log.Printf("Removing invalid file %s (size: %d bytes)", file.Name(), file.Size())
                     os.Remove(filepath.Join(uploadDir, file.Name()))
