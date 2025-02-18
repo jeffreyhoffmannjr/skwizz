@@ -31,14 +31,6 @@ import (
 )
 
 // ============================================================================
-// Build-time Variables: Overridden with -ldflags at compile time
-// ============================================================================
-var (
-    commit    = "dev" // e.g. overridden via -ldflags "-X main.commit=$(git rev-parse HEAD)"
-    buildTime = "dev" // e.g. overridden via -ldflags "-X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-)
-
-// ============================================================================
 // TYPES & SORTING
 // ============================================================================
 type ImageFile struct {
@@ -74,7 +66,7 @@ var (
     }
 )
 
-// govips requires a one-time startup sync
+// govips needs a one-time startup
 var vipsOnce sync.Once
 
 // ============================================================================
@@ -107,6 +99,7 @@ func init() {
     publicKeyData = fmt.Sprintf("%x%x", pubKey.X, pubKey.Y)
 }
 
+// signData signs arbitrary data with our ephemeral private key.
 func signData(data string) string {
     hash := sha256.Sum256([]byte(data))
     r, s, err := ecdsa.Sign(rand.Reader, privateKey, hash[:])
@@ -117,11 +110,12 @@ func signData(data string) string {
     return fmt.Sprintf("%x%x", r, s)
 }
 
+// addLog records an event (upload, delete, shred, etc.) into our cryptographically signed logs.
 func addLog(event, filename string) {
     logMutex.Lock()
     defer logMutex.Unlock()
 
-    // Hash the filename to avoid storing it in plaintext
+    // Hash the filename to avoid plain storage.
     var fileHash string
     if filename != "" {
         shaVal := sha256.Sum256([]byte(filename))
@@ -131,14 +125,13 @@ func addLog(event, filename string) {
     entry := LogEvent{
         Timestamp: time.Now().Format(time.RFC3339),
         Event:     event,
-        Filename:  filename, // optional if you truly want to hide it
+        Filename:  filename, // optionally store or omit the actual name
         Hash:      fileHash,
     }
-    // Signature: sign the combo of Timestamp + Event + Hash
     entry.Signature = signData(entry.Timestamp + entry.Event + entry.Hash)
 
     logEvents = append(logEvents, entry)
-    // Keep only last 50 events for privacy
+    // Keep only the last 50 events for privacy
     if len(logEvents) > 50 {
         logEvents = logEvents[1:]
     }
@@ -303,11 +296,13 @@ func CleanupUploads() {
         if f.IsDir() {
             continue
         }
-        if err := SecureDelete(filePath); err != nil {
+        err := SecureDelete(filePath)
+        if err != nil {
             log.Printf("Error deleting file %s: %v", filePath, err)
             errorsCount++
         } else {
             deletedFiles++
+            // Log the deletion event
             addLog("DELETE", f.Name())
         }
     }
@@ -333,6 +328,11 @@ func CleanupUploads() {
                 log.Printf("Error shredding %s: %v", logFile, err)
             } else {
                 log.Printf("Successfully shredded %s", logFile)
+                // Mask the file path, but still log the shred event.
+                // We'll do a short partial hash:
+                pathHash := sha256.Sum256([]byte(logFile))
+                masked := "log-" + hex.EncodeToString(pathHash[:])[:12]
+                addLog("SHRED", masked)
             }
         } else {
             log.Printf("Skipping shred: %s not present (%v)", logFile, err)
@@ -357,7 +357,9 @@ func CleanupUploads() {
 // MAIN
 // ============================================================================
 func main() {
+    // Force Gin into release mode
     gin.SetMode(gin.ReleaseMode)
+
     log.SetFlags(log.Ldate | log.Ltime)
     log.Println("Starting application...")
 
@@ -377,8 +379,11 @@ func main() {
 
     r := gin.New()
 
-    // Recovery + minimal logging (omits IP)
-    r.Use(gin.Recovery(), func(c *gin.Context) {
+    // 1) Recovery
+    r.Use(gin.Recovery())
+
+    // 2) Minimal logging
+    r.Use(func(c *gin.Context) {
         start := time.Now()
         method := c.Request.Method
         path := c.Request.URL.Path
@@ -394,19 +399,20 @@ func main() {
         )
     })
 
-    // CORS
+    // 3) CORS
     r.Use(cors.New(cors.Config{
-        AllowOrigins:     []string{"https://skwizz.app"},
+        AllowOrigins:     []string{"https://skwizz.app", "http://skwizz.app", "https://www.skwizz.app", "http://www.skwizz.app"},
         AllowMethods:     []string{"GET", "POST", "OPTIONS"},
         AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
         AllowCredentials: false,
     }))
 
-    // Security headers
+    // 4) Security headers
     r.Use(func(c *gin.Context) {
         c.Header("X-Frame-Options", "SAMEORIGIN")
         c.Header("Referrer-Policy", "no-referrer")
         c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+
         csp := "" +
             "default-src 'self'; " +
             "img-src 'self' data:; " +
@@ -414,10 +420,12 @@ func main() {
             "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; " +
             "connect-src 'self'; " +
             "object-src 'none';"
+
         c.Header("Content-Security-Policy", csp)
         c.Next()
     })
 
+    // Set up cron job
     loc, err := time.LoadLocation("Local")
     if err != nil {
         log.Printf("Error loading local timezone: %v", err)
@@ -442,10 +450,10 @@ func main() {
     cronScheduler.Start()
     defer cronScheduler.Stop()
 
-    // Limit max file size
+    // Max file size
     r.MaxMultipartMemory = 32 << 20 // 32 MB
 
-    // Rate limit: 10 requests / minute
+    // Rate-limit: 10 requests/min
     rateVal, err := limiter.NewRateFromFormatted("10-M")
     if err != nil {
         log.Fatalf("Error setting rate limit: %v", err)
@@ -486,7 +494,7 @@ func main() {
         }
     })
 
-    // Upload endpoint
+    // Upload
     r.POST("/upload", limitMiddleware, func(c *gin.Context) {
         file, err := c.FormFile("file")
         if err != nil {
@@ -554,12 +562,11 @@ func main() {
 
         // Log the upload
         addLog("UPLOAD", anonFilename)
-
         log.Printf("Successfully processed file %s", anonFilename)
         c.String(http.StatusOK, "Image uploaded successfully")
     })
 
-    // Index - list the uploaded images
+    // Index with SEO data
     r.GET("/", func(c *gin.Context) {
         files, err := ioutil.ReadDir(uploadDir)
         if err != nil {
@@ -594,8 +601,14 @@ func main() {
         }
         log.Printf("Serving %d valid images", len(images))
 
+        // Pass some basic SEO meta data to the template
         c.HTML(http.StatusOK, "index.html", gin.H{
             "Images": images,
+
+            // Basic SEO fields:
+            "MetaTitle":       "skwizz – secure, temporary image hosting",
+            "MetaDescription": "upload and share images with automatic deletion and privacy-focused features.",
+            "MetaKeywords":    "temporary image hosting, privacy, ephemeral upload, secure sharing",
         })
     })
 
@@ -604,15 +617,11 @@ func main() {
         c.File(filepath.Join(staticDir, "favicon.ico"))
     })
 
-    // Load templates
+    // Templates
     templatesDir := filepath.Join(cwd, "templates")
     r.LoadHTMLGlob(filepath.Join(templatesDir, "*"))
 
-    // =========================
-    // Additional Transparency
-    // =========================
-
-    // 1. /transparency => returns recent logEvents
+    // Additional transparency endpoints
     r.GET("/transparency", func(c *gin.Context) {
         logMutex.Lock()
         defer logMutex.Unlock()
@@ -620,47 +629,20 @@ func main() {
         c.Data(http.StatusOK, "application/json", logsData)
     })
 
-    // 2. /public-key => returns ephemeral ECDSA public key
     r.GET("/public-key", func(c *gin.Context) {
         c.String(http.StatusOK, publicKeyData)
     })
 
-    // 3. /build-info => returns actual commit & buildTime
     r.GET("/build-info", func(c *gin.Context) {
         buildInfo := map[string]string{
-            "commit":     commit,            // set via -ldflags
-            "build_time": buildTime,         // set via -ldflags
-            "source":     "https://github.com/jeffreyhoffmannjr/skwizz",
+            // Replace "dev" with real commit/time if you do a build with -ldflags
+            "commit":     "dev",
+            "build_time": time.Now().Format(time.RFC3339),
+            "source":     "https://github.com/YOUR_GITHUB/skwizz",
         }
         c.JSON(http.StatusOK, buildInfo)
     })
 
-    // 4. /recent-deletions => any DELETE events
-    r.GET("/recent-deletions", func(c *gin.Context) {
-        logMutex.Lock()
-        defer logMutex.Unlock()
-        var deletions []LogEvent
-        for _, le := range logEvents {
-            if le.Event == "DELETE" {
-                deletions = append(deletions, le)
-            }
-        }
-        c.JSON(http.StatusOK, deletions)
-    })
-
-    // 5. /cleanup-status => next cleanup time, events logged
-    r.GET("/cleanup-status", func(c *gin.Context) {
-        entries := cronScheduler.Entries()
-        nextRun := "unknown"
-        if len(entries) > 0 {
-            nextRun = entries[0].Next.Format(time.RFC3339)
-        }
-        c.JSON(http.StatusOK, gin.H{
-            "next_run":      nextRun,
-            "events_logged": len(logEvents),
-        })
-    })
-
-    // Run server on 127.0.0.1:8080 (proxied by Nginx)
+    // Start server on 127.0.0.1:8080 so Nginx can proxy
     r.Run("127.0.0.1:8080")
 }
