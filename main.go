@@ -638,7 +638,7 @@ func main() {
             // Replace "dev" with real commit/time if you do a build with -ldflags
             "commit":     "dev",
             "build_time": time.Now().Format(time.RFC3339),
-            "source":     "https://github.com/YOUR_GITHUB/skwizz",
+            "source":     "https://github.com/jeffreyhoffmannjr/skwizz",
         }
         c.JSON(http.StatusOK, buildInfo)
     })
